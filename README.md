@@ -33,6 +33,8 @@ The project demonstrates the engine's capabilities through two main case studies
 - **Operators**: Support for `+`, `-`, `*` (matmul), `/`, `sin`, `cos`, `exp`, `log`, `relu`, etc.
 - **Graph Pruning**: Automatically prunes the graph for nodes with `requires_grad=false`.
 
+![AD Flowchart](flowchart.png)
+
 ### 2. Integrated Gradients (IG)
 - Implements the path integral formulation:
   $$ IG_i(x) \approx (x_i - x_{0,i}) \times \frac{1}{m} \sum_{k=1}^{m} \nabla_x F\left(x_0 + \frac{k}{m}(x - x_0)\right) $$
@@ -55,6 +57,26 @@ If you wish to run `generate_plots.py`:
 ```bash
 pip install numpy matplotlib
 ```
+
+## 📊 Results
+
+### Case Study 1: Netball Trajectory Optimization
+Optimizing launch parameters (velocity and angle) to hit a target hoop.
+
+**Optimization Process:**
+![Netball Optimization](netball_optimized_en.png)
+
+**Feature Attribution (Integrated Gradients):**
+![Netball Attribution](netball_ig.png)
+
+### Case Study 2: Iris Classification
+Interpreting a neural network trained on the Iris dataset.
+
+**Training Loss:**
+![Iris Loss](iris_loss.png)
+
+**Feature Attribution (Setosa):**
+![Iris Attribution](iris_ig.png)
 
 ## 👥 Contributors
 - **Cao Yuan**
