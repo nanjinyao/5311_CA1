@@ -69,7 +69,7 @@
 
 \lstset{
   extendedchars=true,
-  literate={∉}{{$\notin$}}1 {∈}{{$\in$}}1 
+  literate={∉}{{$\notin$}}1 {∈}{{$\in$}}1 {α}{{$\alpha$}}1 {δ}{{$\delta$}}1 {η}{{$\eta$}}1 {θ}{{$\theta$}}1 {λ}{{$\lambda$}}1 {μ}{{$\mu$}}1 {π}{{$\pi$}}1 {ρ}{{$\rho$}}1 {σ}{{$\sigma$}}1 {τ}{{$\tau$}}1 {ω}{{$\omega$}}1
 }
 % -----------------------------
 % Title
@@ -102,7 +102,7 @@
     
     \vspace{0.8cm}
     
-    {\large Date Last Edited: Feb 13, 2025 \par}
+    {\large Date Last Edited: Feb 16, 2025 \par}
     
     \vfill
     
@@ -116,74 +116,108 @@
 \end{titlepage}
 
 \begin{abstract}
-This work presents a lightweight, ground-up implementation of a reverse-mode automatic differentiation (AD) engine in Julia. Centered on a Tensor abstraction, the framework leverages operator overloading and closure-based pullbacks to compute Vector-Jacobian Products (VJPs) across dynamic computational graphs, with DFS-based topological sorting ensuring robust gradient scheduling. Beyond core AD, we implement Integrated Gradients (IG) to provide equitable feature attribution for both deep learning and differentiable physical simulations. The resulting pipeline demonstrates a unified approach to sensitivity and attribution analysis, effectively bridging the gap between low-level differentiable primitives and high-level interpretability in scientific computing. Our source code is open-source and available at: \url{https://github.com/nanjinyao/EE5311_CA1_AD_IG}
+We present a lightweight reverse-mode automatic differentiation (AD) engine implemented from scratch in Julia. The system builds dynamic computational graphs using a \texttt{Tensor} abstraction with operator overloading, and computes gradients via closure-based pullbacks (VJPs) scheduled by an iterative DFS topological traversal. Elementwise operations are supported through a broadcast-aware rule registry with shape-correct gradient reduction (\texttt{unbroadcast}). On top of this AD core, we implement Integrated Gradients (IG) for interpretability, supporting both AD-based gradients and finite differences for scalar black-box functions. Case studies on projectile-motion optimization and Iris MLP attribution demonstrate a unified pipeline for sensitivity analysis across physics-based and neural models. Our source code is available at: \url{https://github.com/nanjinyao/5311_CA1}.
 \end{abstract}
+``
+
+
 
 
 \section{Introduction}
 
-Interpretability is critical not only for deep learning but also for physical systems governed by differentiable laws. To bridge these domains, this work presents a lightweight reverse-mode automatic differentiation (AD) engine implemented from first principles in Julia~\cite{bezanson2017julia}.
+Automatic Differentiation (AD) is a foundational tool in modern scientific computing, enabling efficient and exact gradient computation for optimization, learning, and sensitivity analysis. While industrial frameworks provide highly optimized AD systems, understanding their internal mechanics is essential for both research transparency and algorithmic innovation. In this work, we implement a reverse-mode AD engine from scratch in Julia, emphasizing clarity, extensibility, and architectural rigor.
 
-The framework is centered on a \texttt{Tensor} abstraction that dynamically constructs computational graphs via operator overloading. By utilizing closure-based \textit{pullbacks} and Depth-First Search (DFS) topological scheduling, the engine efficiently computes Vector-Jacobian Products (VJPs) without the overhead of explicit Jacobian matrices.
+The system is built around a mutable \texttt{Tensor} abstraction that dynamically constructs computational graphs through operator overloading. Reverse-mode differentiation is implemented using closure-based Vector-Jacobian Products (VJPs) and executed via an iterative Depth-First Search (DFS) topological traversal, avoiding recursion limits and ensuring stable gradient scheduling.
 
-Building on this foundation, we integrate \textit{Integrated Gradients} (IG) as a unified attribution mechanism. Experiments on differentiable physical simulations (e.g., projectile motion) demonstrate that this pipeline effectively quantifies parameter sensitivity. This approach highlights how gradients serve as a universal language, connecting low-level differentiable primitives to high-level physical reasoning.
+A distinguishing feature of our implementation is a broadcast-aware differentiation mechanism. Instead of hard-coding elementwise operations, we integrate with Julia's broadcasting system through a custom \texttt{BroadcastStyle}. Backward rules for primitive functions (e.g., addition, multiplication, trigonometric and exponential functions) are managed via an extensible registry. To correctly propagate gradients through broadcasted operations, we introduce an \texttt{unbroadcast} operator that reduces gradients to their original operand shapes. This design separates forward semantics from backward logic and enables modular extension of differentiable primitives.
 
-\section{Core Principle: Chain Rule and VJP}
-The mathematical foundation of reverse-mode AD is the \textbf{Chain Rule} for multi-variable composite functions. In a computational graph, if a scalar output $L$ (usually the loss) depends on a node $u$ through several downstream nodes $v_i$, the gradient of $L$ with respect to $u$ is given by the sum of contributions from all paths:
+On top of the AD core, we implement Integrated Gradients (IG) as a unified attribution method for interpretability. The framework supports both AD-based gradients and finite-difference gradients for scalar-valued black-box functions, allowing consistent interpretability analysis across neural networks and differentiable physical models.
+
+Through experiments on projectile-motion optimization and Iris classification, we demonstrate that gradients serve as a universal computational primitive bridging physics-based reasoning and deep learning interpretability.
+
+
+\section{Core Principle: Chain Rule and Vector--Jacobian Products (VJP)}
+
+Reverse-mode AD computes gradients efficiently for a scalar objective by repeatedly applying the chain rule along a computational graph. Let $L$ be a scalar output and let an intermediate node $u$ feed into one or more downstream nodes $v_1,\dots,v_k$. By the multivariate chain rule, the total derivative with respect to $u$ is the sum of all downstream contributions:
 \begin{equation}
-\frac{\partial L}{\partial u} = \sum_{i} \frac{\partial L}{\partial v_i} \frac{\partial v_i}{\partial u}
+\frac{\partial L}{\partial u}
+= \sum_{i=1}^{k} \frac{\partial L}{\partial v_i}\frac{\partial v_i}{\partial u}.
+\label{eq:chain_rule_fanout}
 \end{equation}
+This ``fan-out'' case is ubiquitous in computational graphs: a value may be reused by multiple operators, so its gradient must accumulate contributions from multiple paths.
 
-In our implementation, we do not explicitly construct large Jacobian matrices. Instead, we compute the \textbf{Vector-Jacobian Product (VJP)}. 
-\begin{itemize}[leftmargin=1.5em]
-    \item \textbf{Forward Pass:} Compute and store the output $v = f(u)$.
-    \item \textbf{Backward Pass:} Receive the downstream gradient $\nabla_v L$, multiply it by the local derivative $\frac{\partial v}{\partial u}$, and \textbf{accumulate} it into the gradient of $u$.
-\end{itemize}
-The accumulation (\texttt{.+=}) is crucial: if a variable is used in multiple operations (fan-out $> 1$), its total gradient must be the sum of gradients from all its consumers.
+Our implementation follows the standard VJP (pullback) formulation used in reverse-mode AD. For each primitive operation producing $v = f(u)$, we do not form Jacobians explicitly. Instead, we store a local \emph{pullback} that maps the downstream sensitivity $g_v \triangleq \partial L/\partial v$ to the upstream sensitivity $g_u \triangleq \partial L/\partial u$:
+\begin{equation}
+g_u \; \mathrel{+}= \; g_v \cdot \frac{\partial f(u)}{\partial u},
+\label{eq:vjp_update}
+\end{equation}
+where $\mathrel{+}=$ denotes in-place accumulation. In code, this corresponds to updating \texttt{parent.grad .+= ...} inside each node's \texttt{\_backward} closure. The closure captures any forward-pass context required to evaluate the local derivative (e.g., operands for multiplication, masks for ReLU, or cached broadcast results for certain elementwise functions).
+
+By repeatedly executing these pullbacks in a valid reverse-topological order (from outputs back to inputs), the engine ensures that when a node's pullback is invoked, its \texttt{grad} field already contains the total accumulated $\partial L/\partial(\texttt{node})$ from all of its downstream consumers. This invariant enables correct gradient propagation without materializing large Jacobian matrices and forms the mathematical backbone of the reverse replay procedure used throughout the project.
+
 
 \section{Core Abstraction: The \texttt{Tensor} Struct}
-The engine is built around a mutable \texttt{Tensor} object. Each \texttt{Tensor} acts as a node in a dynamic computational graph, aware of its data, its gradient, and its ancestors.
 
-\begin{lstlisting}[language=Julia, caption={The actual Tensor implementation from ad\_v7.ipynb}]
+The entire AD engine is built around a mutable \texttt{Tensor} abstraction. Each \texttt{Tensor} instance represents a node in a dynamic computational graph and encapsulates both numerical data and the information required for reverse-mode differentiation.
+
+\begin{lstlisting}[language=Julia, caption={Core Tensor abstraction from MiniAD.jl}]
 mutable struct Tensor
-    data::Array{Float64}          # Numerical values
-    grad::Array{Float64}          # Accumulated gradients
-    _backward::Function           # Pullback closure
-    _prev::Set{Tensor}            # Parent nodes for graph traversal
-    op::String                    # Debugging label
-    requires_grad::Bool           # Gradient tracking flag
+    data::Array{Float64}
+    grad::Array{Float64}
+    _backward::Function
+    _prev::Set{Tensor}
+    op::String
+    requires_grad::Bool
 
     function Tensor(data; _children=(), _op="", requires_grad=true)
-        if data isa Number
-            d = reshape([Float64(data)], 1, 1)
+        d = if data isa Number
+            reshape([Float64(data)], 1, 1)
         else
             arr = convert(Array{Float64}, data)
-            d = ndims(arr) == 1 ? reshape(arr, :, 1) : arr
+            ndims(arr) == 1 ? reshape(arr, :, 1) : arr
         end
+
         g = zeros(size(d))
-        # Structural pruning: only track parents if grad is required
         prev = requires_grad ? Set{Tensor}(_children) : Set{Tensor}()
         new(d, g, () -> nothing, prev, _op, requires_grad)
     end
 end
 \end{lstlisting}
 
-The most critical design choice is the \texttt{\_backward} field. It is a \textbf{closure} that captures the context of the forward operation (like the values of the operands), allowing the local backpropagation logic to be encapsulated within the node itself.
+\subsection{Design Principles}
 
-\section{Algorithm Flow: Construction and Backtracking}
-The execution of the AD engine consists of two distinct phases:
+\paragraph{Uniform 2D Representation.}
+All numerical inputs are internally normalized to two-dimensional arrays:
+scalars are reshaped to $(1,1)$ matrices, and vectors are reshaped to $(n,1)$ column matrices. This design ensures that all operations—particularly matrix multiplication—operate under consistent linear algebra semantics without requiring separate scalar or vector code paths.
 
-\subsection{Phase 1: Dynamic Graph Construction via Operator Overloading}
+\paragraph{Gradient Accumulator.}
+Each tensor stores a \texttt{grad} field of identical shape to \texttt{data}. During backpropagation, gradients are accumulated in-place using \texttt{.+=}. This accumulation is essential for handling fan-out in computational graphs, where a single tensor contributes to multiple downstream operations.
 
-To visualize the complete workflow, Figure \ref{fig:ad_flowchart} illustrates the transition from the forward construction to the backward accumulation.
+\paragraph{Closure-Based Pullback.}
+The field \texttt{\_backward} stores a closure implementing the local Vector–Jacobian Product (VJP). Instead of constructing global Jacobians, each operation defines how downstream sensitivities are mapped back to its parents. The closure captures any forward-pass context required for computing derivatives, enabling modular differentiation logic per operation.
 
-\begin{figure}[htbp]
+\paragraph{Graph Connectivity and Structural Pruning.}
+The field \texttt{\_prev} records parent tensors for graph traversal. However, parents are only tracked if \texttt{requires\_grad=true}. This conditional tracking serves as structural pruning: nodes that do not participate in gradient computation are excluded from the graph, reducing memory overhead and traversal cost.
+
+Together, these components define a minimal yet fully functional reverse-mode AD node abstraction. The computational graph emerges dynamically during forward execution, while the stored pullbacks enable efficient reverse replay without explicit symbolic differentiation.
+
+\subsection{Relation to Industrial Frameworks}
+Readers familiar with deep learning frameworks such as PyTorch~\cite{paszke2019pytorch} will recognize this as the \textbf{Define-by-Run} paradigm. Our \texttt{Tensor} struct plays a similar role to \texttt{torch.Tensor} (specifically with \texttt{requires\_grad=True}), and the closure-based backward pass mimics the Autograd engine.
+
+However, unlike PyTorch's highly optimized C++ backend, MiniAD is implemented entirely in high-level Julia. This offers a pedagogical advantage: the entire lifecycle of a gradient---from graph construction to VJP execution---is transparent and inspectable within a single language, demystifying the black-box nature of industrial AD systems.
+
+
+
+\section{Execution Model: Graph Construction and Reverse Replay}
+
+The MiniAD engine operates in two phases: dynamic graph construction during the forward pass and reverse replay during backpropagation. The overall execution pipeline is illustrated in Figure~\ref{fig:ad_flowchart}.
+
+\begin{figure}[H]
 \centering
 \begin{tikzpicture}[
     node distance=1.5cm,
     startstop/.style={rectangle, rounded corners, minimum width=3cm, minimum height=1cm,text centered, draw=black, fill=red!10},
     process/.style={rectangle, minimum width=3cm, minimum height=1cm, text centered, draw=black, fill=blue!10},
-    decision/.style={diamond, minimum width=3cm, minimum height=1cm, text centered, draw=black, fill=green!10},
     arrow/.style={thick,->,>=stealth}
 ]
 
@@ -199,188 +233,87 @@ To visualize the complete workflow, Figure \ref{fig:ad_flowchart} illustrates th
 \draw [arrow] (backward) -- (end);
 
 \end{tikzpicture}
-\caption{Flowchart of the Reverse-Mode Automatic Differentiation Engine.}
+\caption{Execution pipeline of the MiniAD reverse-mode automatic differentiation engine.}
 \label{fig:ad_flowchart}
 \end{figure}
 
-In our engine, the forward pass does more than just compute values; it builds a directed acyclic graph (DAG) in real-time. When an operation like \texttt{a * b} is invoked, the engine intercepts it via operator overloading to "plant the seeds" for the backward pass. For matrix-based multiplication, the process follows three core steps:
+\subsection{Phase 1: Dynamic Graph Construction}
 
-\begin{enumerate}[leftmargin=1.5em]
-    \item \textbf{Forward Pass:} Compute the product $\mathbf{C} = \mathbf{A}\mathbf{B}$. To ensure a uniform interface, our implementation treats even scalars as $1 \times 1$ matrices and vectors as $n \times 1$ column matrices.
-    \item \textbf{Structural Pruning:} A new \texttt{Tensor} node is created. To optimize memory and computation, its \texttt{\_prev} set is populated only by parent nodes that have \texttt{requires\_grad = true}. If neither parent requires a gradient, the child node's tracking is disabled as well.
-    \item \textbf{VJP (Pullback) Definition:} The engine attaches a closure that implements the Vector-Jacobian Product for matrix multiplication. Given the gradient of the loss with respect to the output $\mathbf{G} = \frac{\partial L}{\partial \mathbf{C}}$, the gradients for the inputs are computed using the following transpose rules:
-    \begin{equation}
-    \frac{\partial L}{\partial \mathbf{A}} = \mathbf{G}\mathbf{B}^\top, \quad \frac{\partial L}{\partial \mathbf{B}} = \mathbf{A}^\top\mathbf{G}
-    \end{equation}
-\end{enumerate}
+During forward execution, each overloaded operator constructs a new \texttt{Tensor} node. The node stores:
 
-
-
-\begin{lstlisting}[language=Julia, caption={Matrix Multiplication implementation with VJP logic from ad\_v7.ipynb}]
-function *(a::Tensor, b::Tensor)
-    # Determine if the output needs to track gradients
-    out_rg = a.requires_grad || b.requires_grad
-    # Structural Pruning: Only track parents that participate in backprop
-    kids = filter(x -> x.requires_grad, (a, b)) 
-    
-    # Perform forward matrix multiplication
-    out = Tensor(a.data * b.data, _children=kids, _op="MatMul", requires_grad=out_rg)
-    
-    if out_rg
-        function _backward()
-            # Matrix VJP: dL/dA = (dL/dC) * B' and dL/dB = A' * (dL/dC)
-            # .+= ensures gradients from different paths are accumulated
-            if a.requires_grad 
-                a.grad .+= out.grad * transpose(b.data) 
-            end
-            if b.requires_grad 
-                b.grad .+= transpose(a.data) * out.grad 
-            end
-        end
-        out._backward = _backward
-    end
-    return out
-end
-\end{lstlisting}
-
-\subsection{Phase 2: Reverse Scheduling via Iterative Topological Sort}
-
-To ensure gradients are propagated correctly, a node must only be processed after all its downstream consumers have finished accumulating their gradients. While a recursive DFS is intuitive, it can lead to \textbf{stack overflow} in deep computational graphs. Our implementation utilizes an \textbf{iterative DFS} with an explicit stack to generate the topological order, ensuring both memory stability and execution correctness.
-
-\paragraph{The Iterative DFS Mechanism:}
-The algorithm uses a stack to manage the traversal, where each entry is a tuple \texttt{(node, processed\_flag)}:
-\begin{itemize}[leftmargin=1.5em]
-    \item \textbf{Discovery Phase:} When a node is first encountered (\texttt{processed\_flag = false}), it is pushed back onto the stack with the flag set to \texttt{true}, followed by all its unvisited parents.
-    \item \textbf{Post-order Completion:} When a node is popped and its flag is \texttt{true}, it means all its dependencies have been explored. The node is then added to the \texttt{topo} list. This effectively simulates post-order traversal without recursion.
-    \item \textbf{Reversal:} Reversing this list yields a valid reverse-topological order, starting from the output and ending at the inputs.
+\begin{itemize}
+    \item The computed numerical result in \texttt{data}
+    \item References to differentiable parents in \texttt{\_prev}
+    \item A closure implementing the local VJP in \texttt{\_backward}
 \end{itemize}
 
-\begin{lstlisting}[language=Julia, caption={Iterative topological sort and backward execution from ad\_v7.ipynb}]
-function backward_iterative(root::Tensor; init_grad=nothing)
-    # Early exit if root does not participate in gradients
-    if !root.requires_grad return nothing end
+Because parent references are recorded only when \texttt{requires\_grad=true}, non-differentiable branches are structurally pruned from the graph. The computational graph therefore emerges implicitly from standard Julia expressions, without requiring a separate graph-building interface.
 
-    # --- Step 1: Iterative Topological Sort ---
-    topo = Tensor[]
-    visited = Set{Tensor}()
-    stack = [(root, false)]  # (node, processed_flag)
-    
-    while !isempty(stack)
-        curr, processed = pop!(stack)
-        if curr in visited continue end
-        
-        if processed
-            push!(visited, curr)
-            push!(topo, curr) # Post-order: added after all ancestors
-        else
-            # Re-push current node with processed=true
-            push!(stack, (curr, true))
-            # Push all unvisited parents to the stack
-            for parent in curr._prev
-                if parent ∉ visited 
-                    push!(stack, (parent, false)) 
-                end
-            end
-        end
-    end
-    
-    # --- Step 2: Gradient Seeding ---
-    if init_grad === nothing
-        root.grad .= 1.0
-    else
-        # Stability check: ensure dimensions match
-        root.grad .= (init_grad isa Number) ? Float64(init_grad) : init_grad
-    end
+\subsection{Phase 2: Iterative Topological Scheduling}
 
-    # --- Step 3: Reverse-Topological Replay ---
-    # Replay pullbacks in reverse order (from output to input)
-    for node in reverse(topo)
-        node._backward()
-    end
-end
-\end{lstlisting}
+To ensure correct gradient propagation, a node must be processed only after all downstream consumers have contributed to its gradient. This is achieved through a post-order traversal implemented via an explicit stack.
 
-By using a stack-based iterative approach, the engine can handle arbitrarily deep models (like very deep ResNets or long sequences in RNNs) that would otherwise crash a recursive implementation. The \texttt{reverse(topo)} loop ensures that when \texttt{node.\_backward()} is executed, the \texttt{node.grad} field is "fully baked"—meaning it has already received all partial gradient contributions from every downstream operation (see Algorithm~\ref{alg:reverse-ad}).
+The full implementation of the iterative topological sort is provided in Appendix~\ref{app:topo_sort}.
+
+The traversal builds a post-order list \texttt{topo}. Reversing this list yields a valid reverse-topological order, ensuring that when \texttt{node.\_backward()} is executed, \texttt{node.grad} already equals the total derivative accumulated from all downstream paths.
+
+\subsection{Reverse Replay Invariant}
+
+The correctness of reverse-mode AD relies on the following invariant:
+
+\begin{quote}
+When a node's pullback is executed, its gradient field already stores the complete $\partial L/\partial(\texttt{node})$ accumulated from all consumers.
+\end{quote}
+
+This invariant is guaranteed by the post-order construction followed by reverse iteration. The output node is first seeded with $\partial L/\partial L = 1$, and successive pullbacks propagate sensitivities backward via in-place accumulation.
+
+\subsection{Stability Considerations}
+
+The stack-based implementation avoids recursion depth limits and supports arbitrarily deep computational graphs. Combined with structural pruning at the node level, this yields a memory-stable and execution-safe reverse-mode engine suitable for both neural networks and differentiable physical models.
+
+\section{Broadcast-Based Elementwise Differentiation}
+
+MiniAD integrates with Julia's broadcasting mechanism to support elementwise operations efficiently. Instead of hard-coding primitives, we use a custom \texttt{BroadcastStyle} and a backward rule registry. This allows operations like \texttt{sin.(x)} or \texttt{x .+ y} to automatically participate in the AD graph. Detailed implementation of the broadcast registry, custom style, and shape-correct gradient reduction (\texttt{unbroadcast}) is detailed in Appendix~\ref{app:broadcast}.
+
 
 \section{Integrated Gradients for Interpretability}
 
-While raw gradients provide local sensitivity, they often suffer from the \textit{saturation problem} in deep networks or complex physical models, where the gradient becomes near-zero even for important features. To address this, we implement \textbf{Integrated Gradients (IG)}, which computes attribution by integrating the gradients along a straight-line path from a baseline $x_0$ to the input $x$. The continuous definition for the $i$-th feature is:
+While reverse-mode AD provides local sensitivity information, raw gradients often fail to capture feature importance in nonlinear models due to gradient saturation. To obtain a more faithful attribution measure, we implement \emph{Integrated Gradients} (IG), which computes feature attributions by integrating gradients along a straight-line path from a baseline input $x_0$ to the target input $x$.
+
+For a scalar-valued model $F$, the $i$-th attribution is defined as:
 \begin{equation}
-\mathrm{IG}_i(x) \coloneqq (x_i - x_{0,i}) \int_{\alpha=0}^{1} \frac{\partial F(x_0 + \alpha(x - x_0))}{\partial x_i} d\alpha
-\end{equation}
-As analytical integration is typically intractable for complex differentiable models $F$, we approximate this integral using a \textbf{Riemann sum}. By sampling gradients at $m$ discrete points along the path and averaging them, we obtain the computable discrete form used in our implementation (Algorithm~\ref{alg:ig-ad}):
-\begin{equation}
-\mathrm{IG}_i(x) \approx (x_i - x_{0,i}) \times \frac{1}{m} \sum_{k=1}^{m} \nabla_x F\left(x_0 + \frac{k}{m}(x - x_0)\right)
+\mathrm{IG}_i(x) 
+= (x_i - x_{0,i}) 
+\int_{0}^{1}
+\frac{\partial F\big(x_0 + \alpha(x-x_0)\big)}{\partial x_i}
+\, d\alpha.
 \end{equation}
 
-\subsection{Key Implementation Details}
-Our implementation in Julia is designed to be versatile, supporting both neural networks (via \texttt{Chain}) and arbitrary physical functions. Key features include:
-\begin{itemize}[leftmargin=1.5em]
-    \item \textbf{Dual Mode Support:} The method can compute gradients using our \texttt{:ad} engine or via \texttt{:fd} (Finite Differences) for non-differentiable black-box functions.
-    \item \textbf{Gradient Resetting:} To avoid accumulation of gradients from previous interpolation steps, we explicitly reset \texttt{xt.grad}, \texttt{out.grad}, and \texttt{y.grad} to zero in each iteration.
-    \item \textbf{Dimensional Alignment:} Inputs and baselines are normalized to 2D arrays to ensure matrix operations remain consistent.
+In practice, this integral is approximated using a Riemann sum with $m$ steps:
+\begin{equation}
+\mathrm{IG}(x) 
+\approx 
+(x - x_0) \odot 
+\frac{1}{m}
+\sum_{k=1}^{m}
+\nabla_x F\!\left(x_0 + \frac{k}{m}(x-x_0)\right),
+\end{equation}
+where $\odot$ denotes elementwise multiplication.
+
+Our implementation supports both AD-based gradients and finite differences, ensuring applicability to both differentiable tensors and black-box functions. The full code listing and design details (such as 2D alignment and gradient resetting) are discussed in Appendix~\ref{app:ig_details}.
+
+\subsection{Interpretability Across Domains}
+
+Because the IG implementation operates purely on gradients, it can be applied uniformly to:
+\begin{itemize}
+    \item Neural networks built from MiniAD layers
+    \item Differentiable physical models expressed using Tensor operations
+    \item Scalar black-box functions via finite differences
 \end{itemize}
 
-\begin{lstlisting}[language=Julia, caption={Integrated Gradients implementation from ad\_v7.ipynb}]
-function integrated_gradients(model,
-    input,
-    baseline;
-    steps::Int=50,
-    target::Union{Nothing,Int}=nothing,
-    method::Symbol=:ad,
-    fd_eps::Float64=1e-5)
+This unifies sensitivity analysis across machine learning and physics-based simulations within a single computational framework.
 
-    # Normalize input/baseline to 2D arrays (n x 1)
-    x = input isa Number ? reshape([Float64(input)], 1, 1) : convert(Array{Float64}, input)
-    x0 = baseline isa Number ? reshape([Float64(baseline)], 1, 1) : convert(Array{Float64}, baseline)
 
-    @assert size(x) == size(x0) "input and baseline must have same shape"
-
-    diff = x .- x0  # Direction vector from baseline to input
-    total_grads = zeros(size(x))
-
-    # Riemann approximation of path integral
-    for s in 1:steps
-        alpha = s / steps  # Interpolation factor
-        z = x0 .+ alpha .* diff  # Interpolated point on the path
-
-        if method == :ad
-            # Automatic differentiation approach
-            xt = Tensor(z, _op="Input")
-            out = model(xt)
-            # Use helper to ensure a scalar output for backpropagation
-            y = to_scalar(out; target=target)
-
-            # Reset gradients before backward pass to avoid step pollution
-            if model isa Chain
-                zero_grad!(model)
-            end
-            xt.grad .= 0.0
-            out.grad .= 0.0
-            y.grad .= 0.0
-
-            backward(y)
-            total_grads .+= xt.grad
-
-        elseif method == :fd
-            # Finite difference approach for black-box models
-            g, _ = grad_fd(model, copy(z); eps=fd_eps)
-            total_grads .+= g
-
-        else
-            error("Unknown method: $method. Use :ad or :fd.")
-        end
-    end
-
-    # Compute final attributions: (input - baseline) * average_gradient
-    avg_grads = total_grads ./ steps
-    attrs = diff .* avg_grads
-    return attrs
-end
-\end{lstlisting}
-
-\subsection{Completeness and Attribution}
-One major advantage of this implementation is that it satisfies the \textbf{Completeness Axiom}: the sum of the resulting attribution vector \texttt{attrs} will approximately equal the difference in the model's output, $F(x) - F(x_0)$. This provides a physically grounded interpretation of how much each parameter (like velocity or damping in a physical system) contributes to the final outcome.
 
 \section{Numerical Experiments and Case Studies}
 We demonstrate the efficacy of our from-scratch AD and IG implementation through two case studies: optimizing a physics-based projectile model and interpreting a neural network classifier.
@@ -452,6 +385,9 @@ Bezanson, J., Edelman, A., Karpinski, S., \& Shah, V. B. (2017). Julia: A fresh 
 
 \bibitem{fisher1936use}
 Fisher, R. A. (1936). The use of multiple measurements in taxonomic problems. Annals of eugenics, 7(2), 179-188.
+
+\bibitem{paszke2019pytorch}
+Paszke, A., Gross, S., Massa, F., Lerer, A., Bradbury, J., Chanan, G., ... \& Chintala, S. (2019). PyTorch: An imperative style, high-performance deep learning library. In Advances in neural information processing systems (pp. 8026-8037).
 \end{thebibliography}
 
 
@@ -459,7 +395,6 @@ Fisher, R. A. (1936). The use of multiple measurements in taxonomic problems. An
 \appendix
 \section{Appendix}
 \subsection{Algorithms} \label{app:algorithms}
-
 \begin{algorithm}[H]
 \caption{Reverse-Mode AD via Iterative Topological Sort}
 \label{alg:reverse-ad}
@@ -512,6 +447,210 @@ Fisher, R. A. (1936). The use of multiple measurements in taxonomic problems. An
 \State $\mathrm{IG}(x) \leftarrow \Delta \odot \bar{G}$
 \end{algorithmic}
 \end{algorithm}
+
+\subsection{Implementation of Iterative Topological Sort} \label{app:topo_sort}
+The iterative topological sort ensures stack-safety for deep graphs.
+\begin{lstlisting}[language=Julia, caption={Iterative topological traversal and reverse replay}]
+function backward_iterative(root::Tensor; init_grad=nothing)
+    if !root.requires_grad
+        return nothing
+    end
+
+    topo = Tensor[]
+    visited = Set{Tensor}()
+    stack = [(root, false)]
+
+    while !isempty(stack)
+        curr, processed = pop!(stack)
+        if curr in visited
+            continue
+        end
+
+        if processed
+            push!(visited, curr)
+            push!(topo, curr)
+        else
+            push!(stack, (curr, true))
+            for parent in curr._prev
+                if parent ∉ visited
+                    push!(stack, (parent, false))
+                end
+            end
+        end
+    end
+
+    root.grad .= (init_grad === nothing ? 1.0 : init_grad)
+
+    for node in reverse(topo)
+        node._backward()
+    end
+end
+\end{lstlisting}
+
+\subsection{Implementation of Broadcast Differentiation} \label{app:broadcast}
+While matrix multiplication and reduction operators are implemented explicitly, most elementwise operations in MiniAD are handled through Julia's broadcasting mechanism. Instead of defining separate forward and backward logic for each primitive (e.g., addition, multiplication, trigonometric functions), we integrate directly with Julia's broadcast infrastructure and implement a modular backward rule registry.
+
+\subsubsection{Custom Broadcast Style}
+
+MiniAD defines a custom \texttt{TensorStyle} to intercept broadcasted operations:
+
+\begin{lstlisting}[language=Julia, caption={Custom broadcast style definition}]
+struct TensorStyle <: BroadcastStyle end
+Base.BroadcastStyle(::Type{Tensor}) = TensorStyle()
+Base.BroadcastStyle(::TensorStyle, ::BroadcastStyle) = TensorStyle()
+Base.BroadcastStyle(::BroadcastStyle, ::TensorStyle) = TensorStyle()
+
+broadcastable(t::Tensor) = t
+\end{lstlisting}
+
+This allows expressions such as \texttt{a .+ b}, \texttt{sin.(x)}, or \texttt{exp.(x)} to construct differentiable graph nodes automatically.
+
+\subsubsection{Backward Rule Registry}
+
+Rather than embedding gradient logic inside the broadcast dispatcher, we maintain a registry mapping primitive functions to their backward rules:
+
+\begin{lstlisting}[language=Julia, caption={Broadcast backward rule registry}]
+const BROADCAST_RULES = IdDict{Any,Function}()
+
+function register_broadcast_rule!(f, rule::Function)
+    BROADCAST_RULES[f] = rule
+end
+\end{lstlisting}
+
+When a broadcasted operation is executed, MiniAD:
+
+\begin{enumerate}
+    \item Extracts raw data from \texttt{Tensor} arguments
+    \item Performs the forward broadcast computation
+    \item Constructs a new \texttt{Tensor} node
+    \item Looks up the corresponding backward rule from the registry
+    \item Attaches the rule as the node's \texttt{\_backward} closure
+\end{enumerate}
+
+If no rule is registered, an explicit error is raised, preventing silent gradient failures.
+
+\subsubsection{Shape-Correct Gradient Reduction: \texttt{unbroadcast}}
+
+Broadcasted operations may expand singleton dimensions. During backpropagation, gradients must therefore be reduced back to the original operand shape. This is handled by the \texttt{unbroadcast} operator:
+
+\begin{lstlisting}[language=Julia, caption={Gradient shape reduction for broadcasted ops}]
+function unbroadcast(out_grad::AbstractArray, orig_size::Tuple)
+    g = out_grad
+
+    while ndims(g) > length(orig_size)
+        g = sum(g, dims=1)
+    end
+
+    for d in 1:length(orig_size)
+        if orig_size[d] == 1 && size(g, d) != 1
+            g = sum(g, dims=d)
+        end
+    end
+
+    return reshape(g, orig_size)
+end
+\end{lstlisting}
+
+This ensures that the gradient passed back to each operand matches its original dimensions, preserving consistency across scalar, vector, and matrix broadcasts.
+
+\subsubsection{Example: Elementwise Multiplication}
+
+For example, the broadcast rule for elementwise multiplication is registered as:
+
+\begin{lstlisting}[language=Julia]
+register_broadcast_rule!(*, (out, res, args...) -> begin
+    x, y = args
+    if x isa Tensor && x.requires_grad
+        val_y = y isa Tensor ? y.data : y
+        x.grad .+= unbroadcast(out.grad .* val_y, size(x.data))
+    end
+    if y isa Tensor && y.requires_grad
+        val_x = x isa Tensor ? x.data : x
+        y.grad .+= unbroadcast(out.grad .* val_x, size(y.data))
+    end
+end)
+\end{lstlisting}
+
+The backward rule directly implements the local derivative
+\[
+\frac{\partial (x \cdot y)}{\partial x} = y, \quad
+\frac{\partial (x \cdot y)}{\partial y} = x,
+\]
+while ensuring correct dimensional reduction.
+
+\subsubsection{Extensibility}
+
+This registry-based design cleanly separates forward semantics from backward logic. New differentiable primitives can be added without modifying the core AD engine—only a corresponding broadcast rule needs to be registered.
+
+Compared to monolithic AD implementations, this approach provides a modular and extensible differentiation framework while remaining minimal in code complexity.
+
+\subsection{Details of Integrated Gradients} \label{app:ig_details}
+\subsubsection{Implementation in MiniAD}
+
+The implementation follows the definition directly:
+
+\begin{lstlisting}[language=Julia, caption={Integrated Gradients implementation in MiniAD}]
+function integrated_gradients(model, input, baseline;
+    steps::Int=50, target=nothing, method=:ad)
+
+    x = _align2d(input)
+    x0 = _align2d(baseline)
+
+    diff = x .- x0
+    total_grads = zeros(size(x))
+
+    for s in 1:steps
+        α = s / steps
+        z = x0 .+ α .* diff
+
+        if method == :ad
+            xt = Tensor(z, _op="Input")
+            out = model(xt)
+            y = to_scalar(out; target=target)
+
+            if model isa Chain
+                zero_grad!(model)
+            end
+
+            xt.grad .= 0.0
+            y.grad .= 0.0
+
+            backward(y)
+            total_grads .+= xt.grad
+
+        elseif method == :fd
+            g, _ = grad_fd(model, copy(z))
+            total_grads .+= g
+        end
+    end
+
+    avg_grads = total_grads ./ steps
+    return diff .* avg_grads
+end
+\end{lstlisting}
+
+\subsubsection{Key Design Aspects}
+
+\paragraph{2D Alignment.}
+Inputs and baselines are internally normalized to 2D arrays to maintain consistency with the Tensor abstraction. This avoids special-case handling for scalars and vectors.
+
+\paragraph{Dual Gradient Modes.}
+The implementation supports two gradient computation modes:
+\begin{itemize}
+    \item \texttt{:ad} --- Uses the reverse-mode AD engine.
+    \item \texttt{:fd} --- Uses finite differences for scalar-valued black-box functions.
+\end{itemize}
+This allows attribution analysis even when the model is not constructed using MiniAD tensors.
+
+\paragraph{Gradient Resetting.}
+Before each backward pass, gradients of the input tensor (and model parameters, if applicable) are reset. This prevents cross-step contamination during the Riemann approximation.
+
+\paragraph{Completeness Property.}
+The implementation satisfies the Completeness Axiom:
+\[
+\sum_i \mathrm{IG}_i(x) \approx F(x) - F(x_0),
+\]
+up to numerical approximation error from discretization. This provides a consistency check for attribution correctness.
 
 \subsection{Member Contributions}
 \begin{itemize}
